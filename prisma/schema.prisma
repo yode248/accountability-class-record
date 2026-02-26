@@ -1,0 +1,340 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// User model with role-based access
+model User {
+  id            String          @id @default(cuid())
+  email         String          @unique
+  name          String?
+  password      String?         // Hashed password
+  role          UserRole        @default(STUDENT)
+  avatar        String?
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+  
+  // Teacher-specific
+  ownedClasses  Class[]         @relation("ClassOwner")
+  
+  // Student-specific
+  studentProfile StudentProfile?
+  enrollments   Enrollment[]
+  
+  // Submissions
+  scoreSubmissions      ScoreSubmission[]
+  attendanceSubmissions AttendanceSubmission[]
+  
+  // Notifications
+  notificationsReceived Notification[]  @relation("NotificationsReceived")
+  notificationsSent     Notification[]  @relation("NotificationsSent")
+  
+  // Audit logs
+  auditLogs     AuditLog[]
+  
+  // OTP for authentication
+  otps          OTP[]
+}
+
+enum UserRole {
+  TEACHER
+  STUDENT
+}
+
+// Notification types
+enum NotificationType {
+  REMINDER_MISSING_SUBMISSION
+  REMINDER_REVISION
+  GENERAL
+}
+
+// In-app notifications for students
+model Notification {
+  id          String            @id @default(cuid())
+  toUserId    String
+  toUser      User              @relation("NotificationsReceived", fields: [toUserId], references: [id], onDelete: Cascade)
+  fromUserId  String
+  fromUser    User              @relation("NotificationsSent", fields: [fromUserId], references: [id], onDelete: Cascade)
+  classId     String?
+  activityId  String?
+  type        NotificationType
+  title       String
+  message     String
+  isRead      Boolean           @default(false)
+  createdAt   DateTime          @default(now())
+  
+  @@index([toUserId, isRead])
+  @@index([toUserId, createdAt])
+}
+
+// OTP for email verification
+model OTP {
+  id        String   @id @default(cuid())
+  code      String
+  email     String
+  expiresAt DateTime
+  used      Boolean  @default(false)
+  createdAt DateTime @default(now())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// Student profile with LRN and other details
+model StudentProfile {
+  id          String      @id @default(cuid())
+  userId      String      @unique
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fullName    String
+  lrn         String      @unique // Learner Reference Number
+  sex         String?     // M/F
+  section     String?     // Will be auto-filled from class
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+  
+  enrollments Enrollment[]
+}
+
+// Class created by teacher
+model Class {
+  id              String      @id @default(cuid())
+  name            String
+  subject         String
+  section         String
+  schoolYear      String      // e.g., "2024-2025"
+  quarter         Int         @default(1) // 1-4: Q1, Q2, Q3, Q4
+  code            String      @unique // Class join code
+  ownerId         String
+  owner           User        @relation("ClassOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  isActive        Boolean     @default(true)
+  qrToken         String?     // For QR-based joining
+  
+  // Quarter-based class linkage system
+  // Semester is derived: Q1,Q2 = Sem 1; Q3,Q4 = Sem 2
+  // linkedFromClassId points to the PREVIOUS quarter's class (Q1→Q2, Q2→Q3, Q3→Q4)
+  linkedFromClassId String?   // Links to previous quarter class
+  linkedFrom      Class?      @relation("QuarterLink", fields: [linkedFromClassId], references: [id], onDelete: SetNull)
+  linkedTo        Class[]     @relation("QuarterLink") // Next quarter class
+  
+  // Grading period status
+  gradingPeriodStatus  GradingPeriodStatus @default(OPEN)
+  gradingPeriodCompletedAt DateTime?
+  gradingPeriodCompletedBy String?
+  
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+  
+  enrollments     Enrollment[]
+  gradingScheme   GradingScheme?
+  activities      Activity[]
+  attendanceSessions AttendanceSession[]
+}
+
+// Grading period status enum
+enum GradingPeriodStatus {
+  OPEN      // Teacher can add activities, students see tentative grade only
+  COMPLETED // Grading period locked, students see current grade
+}
+
+// Student enrollment in a class
+model Enrollment {
+  id          String      @id @default(cuid())
+  classId     String
+  class       Class       @relation(fields: [classId], references: [id], onDelete: Cascade)
+  studentId   String
+  student     User        @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  profileId   String
+  profile     StudentProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  enrolledAt  DateTime    @default(now())
+  isActive    Boolean     @default(true)
+  
+  // Unique constraint for student-class combination
+  @@unique([classId, studentId])
+}
+
+// Grading scheme for a class
+model GradingScheme {
+  id                      String    @id @default(cuid())
+  classId                 String    @unique
+  class                   Class     @relation(fields: [classId], references: [id], onDelete: Cascade)
+  writtenWorksPercent     Float     @default(30)
+  performanceTasksPercent Float     @default(50)
+  quarterlyAssessmentPercent Float  @default(20)
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+  
+  transmutationRules      TransmutationRule[]
+}
+
+// Transmutation table for grade conversion (DepEd style)
+model TransmutationRule {
+  id              String        @id @default(cuid())
+  gradingSchemeId String
+  gradingScheme   GradingScheme @relation(fields: [gradingSchemeId], references: [id], onDelete: Cascade)
+  minPercent      Float         // Minimum percentage score
+  maxPercent      Float         // Maximum percentage score
+  transmutedGrade Float         // Converted grade (1-100 or 70-100)
+  createdAt       DateTime      @default(now())
+  
+  @@index([gradingSchemeId])
+}
+
+// Activity types
+enum ActivityCategory {
+  WRITTEN_WORK      // WW
+  PERFORMANCE_TASK  // PT
+  QUARTERLY_ASSESSMENT // QA
+}
+
+// Activity created by teacher
+model Activity {
+  id                  String            @id @default(cuid())
+  classId             String
+  class               Class             @relation(fields: [classId], references: [id], onDelete: Cascade)
+  category            ActivityCategory
+  title               String
+  description         String?
+  maxScore            Float
+  dueDate             DateTime?
+  instructions        String?
+  requiresEvidence    Boolean           @default(false)
+  evidenceTypes       String?           // JSON array: ["photo", "file", "link"]
+  order               Int               @default(0)
+  isActive            Boolean           @default(true)
+  
+  // Soft delete / Archive fields
+  archived            Boolean           @default(false)
+  archivedAt          DateTime?
+  archivedBy          String?           // User ID who archived
+  archiveReason       String?
+  
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+  
+  submissions         ScoreSubmission[]
+  
+  @@index([classId, archived])
+}
+
+// Submission status
+enum SubmissionStatus {
+  PENDING
+  APPROVED
+  DECLINED
+  NEEDS_REVISION
+}
+
+// Score submission by student
+model ScoreSubmission {
+  id              String          @id @default(cuid())
+  activityId      String
+  activity        Activity        @relation(fields: [activityId], references: [id], onDelete: Cascade)
+  studentId       String
+  student         User            @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  rawScore        Float
+  evidenceUrl     String?         // URL to uploaded evidence
+  evidenceType    String?         // "photo", "file", "link"
+  notes           String?         // Student notes
+  status          SubmissionStatus @default(PENDING)
+  teacherFeedback String?         // Feedback from teacher
+  reviewedAt      DateTime?
+  reviewedBy      String?         // Teacher user ID
+  submittedAt     DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+  
+  auditLogs       AuditLog[]
+  
+  @@unique([activityId, studentId]) // One submission per student per activity
+}
+
+// Attendance session created by teacher
+model AttendanceSession {
+  id              String              @id @default(cuid())
+  classId         String
+  class           Class               @relation(fields: [classId], references: [id], onDelete: Cascade)
+  date            DateTime
+  title           String?
+  lateThresholdMinutes Int            @default(15) // Minutes after start time to be considered late
+  qrToken         String?             // For QR-based check-in
+  qrExpiresAt     DateTime?           // QR code expiration
+  isActive        Boolean             @default(true)
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+  
+  submissions     AttendanceSubmission[]
+}
+
+// Attendance status
+enum AttendanceStatus {
+  PRESENT
+  LATE
+  ABSENT
+}
+
+// Attendance submission by student
+model AttendanceSubmission {
+  id              String            @id @default(cuid())
+  sessionId       String
+  session         AttendanceSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  studentId       String
+  student         User              @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  status          AttendanceStatus  @default(PRESENT)
+  proofUrl        String?           // URL to proof (photo, etc.)
+  checkedInAt     DateTime?         // When student checked in
+  notes           String?
+  submissionStatus SubmissionStatus  @default(PENDING)
+  teacherFeedback String?
+  reviewedAt      DateTime?
+  reviewedBy      String?
+  submittedAt     DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+  
+  auditLogs       AuditLog[]
+  
+  @@unique([sessionId, studentId]) // One submission per student per session
+}
+
+// Audit log for all changes
+model AuditLog {
+  id          String    @id @default(cuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  action      String    // CREATE, UPDATE, APPROVE, DECLINE, OVERRIDE, etc.
+  entityType  String    // ScoreSubmission, AttendanceSubmission, etc.
+  entityId    String
+  oldValue    String?   // JSON string of old values
+  newValue    String?   // JSON string of new values
+  reason      String?   // Reason for change (required for overrides)
+  createdAt   DateTime  @default(now())
+  
+  // Relations to specific entities (optional)
+  scoreSubmissionId      String?
+  scoreSubmission        ScoreSubmission?  @relation(fields: [scoreSubmissionId], references: [id], onDelete: SetNull)
+  attendanceSubmissionId String?
+  attendanceSubmission   AttendanceSubmission? @relation(fields: [attendanceSubmissionId], references: [id], onDelete: SetNull)
+  
+  @@index([userId])
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
+
+// Offline queue for PWA (stored locally but we can track sync status)
+model SyncQueue {
+  id          String    @id @default(cuid())
+  userId      String
+  entityType  String
+  entityId    String
+  action      String
+  data        String    // JSON string of data to sync
+  synced      Boolean   @default(false)
+  syncedAt    DateTime?
+  createdAt   DateTime  @default(now())
+  
+  @@index([userId, synced])
+}
