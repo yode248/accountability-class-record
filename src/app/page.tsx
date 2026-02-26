@@ -4458,6 +4458,95 @@ function StudentDashboard({ goLanding }: { goLanding: () => void }) {
             </div>
           </div>
           <div className="flex items-center gap-2">
+            {/* Notifications Bell */}
+            <div className="relative">
+              <Button 
+                variant="ghost" 
+                size="icon" 
+                className="text-white hover:bg-teal-700"
+                onClick={() => setShowNotifications(!showNotifications)}
+              >
+                <Bell className="w-5 h-5" />
+                {notificationsData?.unreadCount > 0 && (
+                  <span className="absolute -top-1 -right-1 bg-red-500 text-white text-xs rounded-full w-5 h-5 flex items-center justify-center">
+                    {notificationsData.unreadCount > 9 ? '9+' : notificationsData.unreadCount}
+                  </span>
+                )}
+              </Button>
+              
+              {/* Notifications Dropdown */}
+              {showNotifications && (
+                <div className="absolute right-0 top-full mt-2 w-80 bg-white rounded-lg shadow-lg border z-50 max-h-96 overflow-hidden">
+                  <div className="p-3 border-b flex items-center justify-between">
+                    <h3 className="font-semibold text-gray-900">Notifications</h3>
+                    {notificationsData?.unreadCount > 0 && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="text-xs text-teal-600"
+                        onClick={() => markAllReadMutation.mutate()}
+                      >
+                        Mark all read
+                      </Button>
+                    )}
+                  </div>
+                  <ScrollArea className="max-h-72">
+                    {notificationsLoading ? (
+                      <div className="p-4 text-center text-gray-500">
+                        <RefreshCw className="w-5 h-5 animate-spin mx-auto" />
+                      </div>
+                    ) : !notificationsData?.notifications?.length ? (
+                      <div className="p-4 text-center text-gray-500">
+                        No notifications
+                      </div>
+                    ) : (
+                      <div className="divide-y">
+                        {notificationsData.notifications.map((notification: {
+                          id: string;
+                          title: string;
+                          message: string;
+                          isRead: boolean;
+                          createdAt: string;
+                          type: string;
+                          fromUser?: { name: string };
+                        }) => (
+                          <div
+                            key={notification.id}
+                            className={`p-3 cursor-pointer hover:bg-gray-50 ${
+                              !notification.isRead ? 'bg-teal-50' : ''
+                            }`}
+                            onClick={() => markReadMutation.mutate(notification.id)}
+                          >
+                            <div className="flex items-start gap-2">
+                              {!notification.isRead && (
+                                <div className="w-2 h-2 bg-teal-500 rounded-full mt-2 flex-shrink-0" />
+                              )}
+                              <div className="flex-1 min-w-0">
+                                <p className={`text-sm ${!notification.isRead ? 'font-semibold' : ''}`}>
+                                  {notification.title}
+                                </p>
+                                <p className="text-xs text-gray-600 mt-1 line-clamp-2">
+                                  {notification.message}
+                                </p>
+                                <p className="text-xs text-gray-400 mt-1">
+                                  {new Date(notification.createdAt).toLocaleDateString('en-PH', {
+                                    month: 'short',
+                                    day: 'numeric',
+                                    hour: '2-digit',
+                                    minute: '2-digit'
+                                  })}
+                                </p>
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </ScrollArea>
+                </div>
+              )}
+            </div>
+            
             <Button 
               variant="ghost" 
               size="icon" 
