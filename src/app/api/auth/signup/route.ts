@@ -16,6 +16,17 @@ const signupSchema = z.object({
 
 export async function POST(request: NextRequest) {
   try {
+    // Check database connection first
+    try {
+      await db.$queryRaw`SELECT 1`;
+    } catch (dbError) {
+      console.error("Database connection error:", dbError);
+      return NextResponse.json(
+        { error: "Database connection failed. Please check if the database is configured correctly." },
+        { status: 503 }
+      );
+    }
+
     const body = await request.json();
     const validated = signupSchema.parse(body);
 
@@ -68,8 +79,19 @@ export async function POST(request: NextRequest) {
     });
   } catch (error) {
     console.error("Signup error:", error);
+    
+    // Return more specific error message
+    let errorMessage = "Failed to create account";
+    if (error instanceof Error) {
+      if (error.message.includes("database") || error.message.includes("connection")) {
+        errorMessage = "Database connection error. Please try again later.";
+      } else if (error.message.includes("Unique constraint")) {
+        errorMessage = "Email or LRN already exists";
+      }
+    }
+    
     return NextResponse.json(
-      { error: "Failed to create account" },
+      { error: errorMessage },
       { status: 500 }
     );
   }

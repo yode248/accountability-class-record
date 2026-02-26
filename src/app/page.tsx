@@ -5764,10 +5764,38 @@ export default function Page() {
   const [mounted, setMounted] = useState(false);
   const [showLanding, setShowLanding] = useState(true);
   const [userRole, setUserRole] = useState<"teacher" | "student" | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [healthCheck, setHealthCheck] = useState<{ checked: boolean; healthy: boolean; error?: string }>({ checked: false, healthy: false });
 
   useEffect(() => {
     setMounted(true);
+    
+    // Health check on mount
+    fetch('/api/health')
+      .then(res => res.json())
+      .then(data => {
+        setHealthCheck({ checked: true, healthy: data.status === 'ok', error: data.database?.error });
+        if (data.status !== 'ok') {
+          console.error('Health check failed:', data);
+        }
+      })
+      .catch(err => {
+        console.error('Health check error:', err);
+        setHealthCheck({ checked: true, healthy: false, error: err.message });
+      });
   }, []);
+
+  // Timeout for loading state - show error after 10 seconds
+  useEffect(() => {
+    if (status === "loading") {
+      const timeout = setTimeout(() => {
+        if (status === "loading") {
+          setLoadError("Connection timeout. Please check your internet connection and try again.");
+        }
+      }, 10000);
+      return () => clearTimeout(timeout);
+    }
+  }, [status]);
 
   // Reset to landing when session changes
   useEffect(() => {
@@ -5776,6 +5804,51 @@ export default function Page() {
       setUserRole(null);
     }
   }, [session]);
+
+  // Show error screen if load failed
+  if (loadError || (healthCheck.checked && !healthCheck.healthy)) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gray-50 p-4">
+        <Card className="w-full max-w-md">
+          <CardHeader className="text-center">
+            <div className="w-16 h-16 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4">
+              <AlertCircle className="w-8 h-8 text-red-600" />
+            </div>
+            <CardTitle className="text-xl">Connection Error</CardTitle>
+            <CardDescription>
+              Unable to connect to the server
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="bg-red-50 p-3 rounded-lg border border-red-200">
+              <p className="text-sm text-red-700">
+                {loadError || healthCheck.error || "Database connection failed. Please try again later."}
+              </p>
+            </div>
+            <div className="space-y-2 text-sm text-gray-600">
+              <p><strong>Troubleshooting:</strong></p>
+              <ul className="list-disc list-inside space-y-1">
+                <li>Check your internet connection</li>
+                <li>Clear your browser cache</li>
+                <li>Try refreshing the page</li>
+              </ul>
+            </div>
+            <Button 
+              className="w-full" 
+              onClick={() => {
+                setLoadError(null);
+                setHealthCheck({ checked: false, healthy: false });
+                window.location.reload();
+              }}
+            >
+              <RefreshCw className="w-4 h-4 mr-2" />
+              Retry
+            </Button>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
 
   if (!mounted || status === "loading") {
     return (
