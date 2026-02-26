@@ -1,8 +1,20 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getServerSession } from "next-auth";
-import { authOptions } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { z } from "zod";
+
+// Helper to get current user
+async function getCurrentUser(supabase: Awaited<ReturnType<typeof createSupabaseServerClient>>) {
+  const { data: { user }, error } = await supabase.auth.getUser();
+  if (error || !user) return null;
+  
+  const { data: userData } = await supabase
+    .from("users")
+    .select("id, role")
+    .eq("id", user.id)
+    .single();
+  
+  return userData;
+}
 
 const createSubmissionSchema = z.object({
   activityId: z.string(),
@@ -15,8 +27,10 @@ const createSubmissionSchema = z.object({
 // GET /api/submissions - Get submissions
 export async function GET(request: NextRequest) {
   try {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id) {
+    const supabase = await createSupabaseServerClient();
+    const user = await getCurrentUser(supabase);
+    
+    if (!user) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
@@ -26,66 +40,125 @@ export async function GET(request: NextRequest) {
     const studentId = searchParams.get("studentId");
     const status = searchParams.get("status");
 
-    if (session.user.role === "TEACHER") {
+    if (user.role === "TEACHER") {
       // Teacher sees all submissions for their classes
-      // If studentId is provided, get submissions for that specific student
       if (!classId && !studentId) {
         return NextResponse.json({ error: "Class ID or Student ID required" }, { status: 400 });
       }
 
       // Verify access
       if (classId) {
-        const cls = await db.class.findUnique({
-          where: { id: classId },
-        });
+        const { data: cls } = await supabase
+          .from("classes")
+          .select("id, ownerId")
+          .eq("id", classId)
+          .single();
 
-        if (!cls || cls.ownerId !== session.user.id) {
+        if (!cls || cls.ownerId !== user.id) {
           return NextResponse.json({ error: "Access denied" }, { status: 403 });
         }
       }
 
       // If studentId provided, verify the student is in teacher's class
       if (studentId && !classId) {
-        const enrollment = await db.enrollment.findFirst({
-          where: {
-            studentId,
-            class: { ownerId: session.user.id },
-          },
-        });
+        const { data: enrollment } = await supabase
+          .from("enrollments")
+          .select("id")
+          .eq("studentId", studentId)
+          .eq("isActive", true)
+          .in("classId", (
+            await supabase
+              .from("classes")
+              .select("id")
+              .eq("ownerId", user.id)
+          ).data?.map(c => c.id) || [])
+          .single();
+
         if (!enrollment) {
           return NextResponse.json({ error: "Access denied" }, { status: 403 });
         }
       }
 
-      const where: Record<string, unknown> = {};
-      if (classId) where.activity = { classId };
-      if (studentId) where.studentId = studentId;
-      if (activityId) where.activityId = activityId;
-      if (status) where.status = status;
+      // Build query
+      let query = supabase
+        .from("score_submissions")
+        .select(`
+          id,
+          rawScore,
+          evidenceUrl,
+          evidenceType,
+          notes,
+          status,
+          teacherFeedback,
+          reviewedAt,
+          submittedAt,
+          updatedAt,
+          activity:activities (
+            id,
+            title,
+            category,
+            maxScore,
+            class:classes (id, name)
+          ),
+          student:users!score_submissions_studentId_fkey (
+            id,
+            name,
+            studentProfile:student_profiles (
+              fullName,
+              lrn
+            )
+          )
+        `)
+        .order("submittedAt", { ascending: false });
 
-      const submissions = await db.scoreSubmission.findMany({
-        where,
-        include: {
-          activity: true,
-          student: {
-            include: { studentProfile: true },
-          },
-        },
-        orderBy: { submittedAt: "desc" },
-      });
+      if (classId) {
+        query = query.in("activityId", (
+          await supabase
+            .from("activities")
+            .select("id")
+            .eq("classId", classId)
+        ).data?.map(a => a.id) || []);
+      }
+      if (studentId) query = query.eq("studentId", studentId);
+      if (activityId) query = query.eq("activityId", activityId);
+      if (status) query = query.eq("status", status);
+
+      const { data: submissions, error } = await query;
+
+      if (error) throw error;
 
       return NextResponse.json(submissions);
     } else {
       // Student sees their own submissions
-      const where: Record<string, unknown> = { studentId: session.user.id };
-      if (activityId) where.activityId = activityId;
-      if (status) where.status = status;
+      let query = supabase
+        .from("score_submissions")
+        .select(`
+          id,
+          rawScore,
+          evidenceUrl,
+          evidenceType,
+          notes,
+          status,
+          teacherFeedback,
+          submittedAt,
+          updatedAt,
+          activity:activities (
+            id,
+            title,
+            category,
+            maxScore,
+            class:classes (id, name, subject)
+          )
+        `)
+        .eq("studentId", user.id)
+        .order("submittedAt", { ascending: false });
 
-      const submissions = await db.scoreSubmission.findMany({
-        where,
-        include: { activity: { include: { class: true } } },
-        orderBy: { submittedAt: "desc" },
-      });
+      if (activityId) query = query.eq("activityId", activityId);
+      if (status) query = query.eq("status", status);
+
+      const { data: submissions, error } = await query;
+
+      if (error) throw error;
 
       return NextResponse.json(submissions);
     }
@@ -101,8 +174,10 @@ export async function GET(request: NextRequest) {
 // POST /api/submissions - Submit score (Student only)
 export async function POST(request: NextRequest) {
   try {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id || session.user.role !== "STUDENT") {
+    const supabase = await createSupabaseServerClient();
+    const user = await getCurrentUser(supabase);
+    
+    if (!user || user.role !== "STUDENT") {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
@@ -110,18 +185,29 @@ export async function POST(request: NextRequest) {
     const validated = createSubmissionSchema.parse(body);
 
     // Get activity and verify enrollment
-    const activity = await db.activity.findUnique({
-      where: { id: validated.activityId },
-      include: {
-        class: {
-          include: {
-            enrollments: { where: { studentId: session.user.id } },
-          },
-        },
-      },
-    });
+    const { data: activity, error: activityError } = await supabase
+      .from("activities")
+      .select(`
+        id,
+        maxScore,
+        classId,
+        class:classes (
+          id,
+          enrollments:enrollments!enrollments_classId_fkey (studentId)
+        )
+      `)
+      .eq("id", validated.activityId)
+      .single();
 
-    if (!activity || activity.class.enrollments.length === 0) {
+    if (activityError || !activity) {
+      return NextResponse.json({ error: "Activity not found" }, { status: 404 });
+    }
+
+    // Check enrollment
+    const classData = activity.class as { enrollments?: { studentId: string }[] } | null;
+    const isEnrolled = classData?.enrollments?.some(e => e.studentId === user.id);
+    
+    if (!isEnrolled) {
       return NextResponse.json({ error: "Access denied" }, { status: 403 });
     }
 
@@ -134,30 +220,33 @@ export async function POST(request: NextRequest) {
     }
 
     // Check for existing submission
-    const existing = await db.scoreSubmission.findUnique({
-      where: {
-        activityId_studentId: {
-          activityId: validated.activityId,
-          studentId: session.user.id,
-        },
-      },
-    });
+    const { data: existing } = await supabase
+      .from("score_submissions")
+      .select("id, status")
+      .eq("activityId", validated.activityId)
+      .eq("studentId", user.id)
+      .single();
 
     if (existing) {
       // Update existing submission if it needs revision
       if (existing.status === "NEEDS_REVISION" || existing.status === "DECLINED") {
-        const updated = await db.scoreSubmission.update({
-          where: { id: existing.id },
-          data: {
+        const { data: updated, error: updateError } = await supabase
+          .from("score_submissions")
+          .update({
             rawScore: validated.rawScore,
             evidenceUrl: validated.evidenceUrl,
             evidenceType: validated.evidenceType,
             notes: validated.notes,
             status: "PENDING",
             teacherFeedback: null,
-            submittedAt: new Date(),
-          },
-        });
+            submittedAt: new Date().toISOString(),
+          })
+          .eq("id", existing.id)
+          .select()
+          .single();
+
+        if (updateError) throw updateError;
+
         return NextResponse.json(updated);
       }
 
@@ -168,27 +257,30 @@ export async function POST(request: NextRequest) {
     }
 
     // Create new submission
-    const submission = await db.scoreSubmission.create({
-      data: {
+    const { data: submission, error } = await supabase
+      .from("score_submissions")
+      .insert({
         activityId: validated.activityId,
-        studentId: session.user.id,
+        studentId: user.id,
         rawScore: validated.rawScore,
         evidenceUrl: validated.evidenceUrl,
         evidenceType: validated.evidenceType,
         notes: validated.notes,
-      },
-    });
+        status: "PENDING",
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
 
     // Create audit log
-    await db.auditLog.create({
-      data: {
-        userId: session.user.id,
-        action: "CREATE",
-        entityType: "ScoreSubmission",
-        entityId: submission.id,
-        newValue: JSON.stringify(submission),
-        scoreSubmissionId: submission.id,
-      },
+    await supabase.from("audit_logs").insert({
+      userId: user.id,
+      action: "CREATE",
+      entityType: "ScoreSubmission",
+      entityId: submission.id,
+      newValue: JSON.stringify(submission),
+      scoreSubmissionId: submission.id,
     });
 
     return NextResponse.json(submission);

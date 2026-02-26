@@ -1,12 +1,24 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getServerSession } from "next-auth";
-import { authOptions } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { nanoid } from "nanoid";
 
 // Generate unique class code
 function generateClassCode(): string {
   return nanoid(8).toUpperCase();
+}
+
+// Helper to get current user
+async function getCurrentUser(supabase: Awaited<ReturnType<typeof createSupabaseServerClient>>) {
+  const { data: { user }, error } = await supabase.auth.getUser();
+  if (error || !user) return null;
+  
+  const { data: userData } = await supabase
+    .from("users")
+    .select("id, role")
+    .eq("id", user.id)
+    .single();
+  
+  return userData;
 }
 
 // GET /api/classes/[id] - Get class details
@@ -15,8 +27,10 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id) {
+    const supabase = await createSupabaseServerClient();
+    const user = await getCurrentUser(supabase);
+    
+    if (!user) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
@@ -24,60 +38,146 @@ export async function GET(
     const { searchParams } = new URL(request.url);
     const includeArchived = searchParams.get("includeArchived") === "true";
 
-    const cls = await db.class.findUnique({
-      where: { id },
-      include: {
-        owner: { select: { id: true, name: true, email: true } },
-        gradingScheme: {
-          include: { transmutationRules: { orderBy: { minPercent: 'asc' } } },
-        },
-        activities: {
-          orderBy: [{ category: "asc" }, { order: "asc" }],
-        },
-        attendanceSessions: {
-          orderBy: { date: "desc" },
-        },
-        enrollments: {
-          include: {
-            profile: true,
-            student: { select: { id: true, name: true, email: true } },
-          },
-        },
-        linkedFrom: { select: { id: true, name: true, subject: true, quarter: true } },
-        linkedTo: { select: { id: true, name: true, subject: true, quarter: true } },
-      },
-    });
+    // Get class with all related data
+    const { data: cls, error } = await supabase
+      .from("classes")
+      .select(`
+        id,
+        name,
+        subject,
+        section,
+        schoolYear,
+        quarter,
+        code,
+        ownerId,
+        isActive,
+        qrToken,
+        linkedFromClassId,
+        gradingPeriodStatus,
+        gradingPeriodCompletedAt,
+        gradingPeriodCompletedBy,
+        createdAt,
+        updatedAt,
+        owner:users!classes_ownerId_fkey (
+          id,
+          name,
+          email
+        ),
+        gradingScheme:grading_schemes (
+          id,
+          writtenWorksPercent,
+          performanceTasksPercent,
+          quarterlyAssessmentPercent,
+          transmutationRules:transmutation_rules (
+            id,
+            minPercent,
+            maxPercent,
+            transmutedGrade
+          )
+        ),
+        activities (
+          id,
+          category,
+          title,
+          description,
+          maxScore,
+          dueDate,
+          instructions,
+          requiresEvidence,
+          evidenceTypes,
+          order,
+          isActive,
+          archived,
+          archivedAt,
+          archivedBy,
+          archiveReason,
+          createdAt
+        ),
+        attendanceSessions:attendance_sessions (
+          id,
+          date,
+          title,
+          lateThresholdMinutes,
+          qrToken,
+          qrExpiresAt,
+          isActive,
+          createdAt
+        ),
+        enrollments (
+          id,
+          studentId,
+          enrolledAt,
+          isActive,
+          profile:student_profiles (
+            id,
+            fullName,
+            lrn,
+            sex,
+            section
+          ),
+          student:users!enrollments_studentId_fkey (
+            id,
+            name,
+            email
+          )
+        ),
+        linkedFrom:linkedFromClassId (
+          id,
+          name,
+          subject,
+          quarter
+        ),
+        linkedTo (
+          id,
+          name,
+          subject,
+          quarter
+        )
+      `)
+      .eq("id", id)
+      .single();
 
-    if (!cls) {
+    if (error || !cls) {
       return NextResponse.json({ error: "Class not found" }, { status: 404 });
     }
 
     // Check access
-    const isOwner = cls.ownerId === session.user.id;
-    const isEnrolled = cls.enrollments.some(
-      (e) => e.studentId === session.user.id
-    );
+    const isOwner = cls.ownerId === user.id;
+    const isEnrolled = cls.enrollments?.some((e) => e.studentId === user.id);
 
     if (!isOwner && !isEnrolled) {
       return NextResponse.json({ error: "Access denied" }, { status: 403 });
     }
 
-    // For students, always filter out archived activities
-    // For teachers, filter based on includeArchived parameter
-    let activities = cls.activities;
-    if (session.user.role === "STUDENT") {
+    // Filter activities
+    let activities = cls.activities || [];
+    if (user.role === "STUDENT") {
       activities = activities.filter(a => !a.archived);
     } else if (!includeArchived) {
       activities = activities.filter(a => !a.archived);
     }
 
+    // Sort activities
+    activities.sort((a, b) => {
+      if (a.category !== b.category) {
+        return a.category.localeCompare(b.category);
+      }
+      return (a.order || 0) - (b.order || 0);
+    });
+
+    // Sort attendance sessions
+    const attendanceSessions = (cls.attendanceSessions || []).sort(
+      (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()
+    );
+
     return NextResponse.json({
       ...cls,
       activities,
+      attendanceSessions,
       _count: {
         activities: activities.length,
-        archivedActivities: cls.activities.filter(a => a.archived).length,
-        enrollments: cls.enrollments.length,
+        archivedActivities: (cls.activities || []).filter(a => a.archived).length,
+        enrollments: (cls.enrollments || []).length,
       },
     });
   } catch (error) {
@@ -95,30 +195,29 @@ export async function PUT(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id || session.user.role !== "TEACHER") {
+    const supabase = await createSupabaseServerClient();
+    const user = await getCurrentUser(supabase);
+    
+    if (!user || user.role !== "TEACHER") {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
     const { id } = await params;
     const body = await request.json();
 
-    const cls = await db.class.findUnique({ 
-      where: { id },
-      include: { 
-        gradingScheme: {
-          include: { transmutationRules: true }
-        },
-        enrollments: true,
-      }
-    });
-    if (!cls || cls.ownerId !== session.user.id) {
+    // Check class ownership
+    const { data: cls, error: classError } = await supabase
+      .from("classes")
+      .select("id, ownerId, quarter, gradingPeriodStatus")
+      .eq("id", id)
+      .single();
+
+    if (classError || !cls || cls.ownerId !== user.id) {
       return NextResponse.json({ error: "Access denied" }, { status: 403 });
     }
 
     // Handle generateNextQuarter action
     if (body.generateNextQuarter) {
-      // Verify this is not Q4 (can't generate Q5)
       if (cls.quarter >= 4) {
         return NextResponse.json({ 
           error: "Cannot generate next quarter from Q4 class" 
@@ -126,9 +225,12 @@ export async function PUT(
       }
 
       // Check if next quarter class already exists
-      const existingNext = await db.class.findFirst({
-        where: { linkedFromClassId: id },
-      });
+      const { data: existingNext } = await supabase
+        .from("classes")
+        .select("id, name, quarter")
+        .eq("linkedFromClassId", id)
+        .single();
+
       if (existingNext) {
         return NextResponse.json({ 
           error: `Q${cls.quarter + 1} class already exists for this class`,
@@ -140,60 +242,85 @@ export async function PUT(
       const nextQuarter = cls.quarter + 1;
       const customName = body.name || `${cls.name} - Q${nextQuarter}`;
 
-      // Create next quarter class with copied enrollments
-      const nextQuarterClass = await db.class.create({
-        data: {
+      // Get current grading scheme and enrollments
+      const { data: gradingScheme } = await supabase
+        .from("grading_schemes")
+        .select("*, transmutationRules:transmutation_rules (*)")
+        .eq("classId", id)
+        .single();
+
+      const { data: enrollments } = await supabase
+        .from("enrollments")
+        .select("studentId, profileId")
+        .eq("classId", id);
+
+      // Create next quarter class
+      const { data: nextQuarterClass, error: createError } = await supabase
+        .from("classes")
+        .insert({
           name: customName,
           subject: cls.subject,
           section: cls.section,
           schoolYear: cls.schoolYear,
           quarter: nextQuarter,
           code: classCode,
-          ownerId: session.user.id,
+          ownerId: user.id,
           linkedFromClassId: id,
-          gradingScheme: {
-            create: {
-              writtenWorksPercent: cls.gradingScheme?.writtenWorksPercent || 30,
-              performanceTasksPercent: cls.gradingScheme?.performanceTasksPercent || 50,
-              quarterlyAssessmentPercent: cls.gradingScheme?.quarterlyAssessmentPercent || 20,
-              transmutationRules: {
-                create: cls.gradingScheme?.transmutationRules.map(rule => ({
-                  minPercent: rule.minPercent,
-                  maxPercent: rule.maxPercent,
-                  transmutedGrade: rule.transmutedGrade,
-                })) || [],
-              },
-            },
-          },
-          // Copy all enrollments
-          enrollments: {
-            create: cls.enrollments.map(enrollment => ({
-              studentId: enrollment.studentId,
-              profileId: enrollment.profileId,
-              isActive: true,
-            })),
-          },
-        },
-        include: {
-          enrollments: true,
-        },
-      });
+        })
+        .select()
+        .single();
+
+      if (createError) throw createError;
+
+      // Create grading scheme
+      if (gradingScheme) {
+        const { data: newScheme } = await supabase
+          .from("grading_schemes")
+          .insert({
+            classId: nextQuarterClass.id,
+            writtenWorksPercent: gradingScheme.writtenWorksPercent,
+            performanceTasksPercent: gradingScheme.performanceTasksPercent,
+            quarterlyAssessmentPercent: gradingScheme.quarterlyAssessmentPercent,
+          })
+          .select()
+          .single();
+
+        // Copy transmutation rules
+        if (newScheme && gradingScheme.transmutationRules) {
+          const rulesToInsert = gradingScheme.transmutationRules.map((rule: { minPercent: number; maxPercent: number; transmutedGrade: number }) => ({
+            gradingSchemeId: newScheme.id,
+            minPercent: rule.minPercent,
+            maxPercent: rule.maxPercent,
+            transmutedGrade: rule.transmutedGrade,
+          }));
+          await supabase.from("transmutation_rules").insert(rulesToInsert);
+        }
+      }
+
+      // Copy enrollments
+      if (enrollments && enrollments.length > 0) {
+        const enrollmentsToInsert = enrollments.map(e => ({
+          classId: nextQuarterClass.id,
+          studentId: e.studentId,
+          profileId: e.profileId,
+          isActive: true,
+        }));
+        await supabase.from("enrollments").insert(enrollmentsToInsert);
+      }
 
       // Create audit log
-      await db.auditLog.create({
-        data: {
-          userId: session.user.id,
-          action: "GENERATE_NEXT_QUARTER_CLASS",
-          entityType: "Class",
-          entityId: nextQuarterClass.id,
-          newValue: JSON.stringify({
-            sourceClassId: id,
-            sourceQuarter: cls.quarter,
-            newQuarter: nextQuarter,
-            newClassId: nextQuarterClass.id,
-            enrollmentsCopied: cls.enrollments.length,
-          }),
-        },
+      await supabase.from("audit_logs").insert({
+        userId: user.id,
+        action: "GENERATE_NEXT_QUARTER_CLASS",
+        entityType: "Class",
+        entityId: nextQuarterClass.id,
+        newValue: JSON.stringify({
+          sourceClassId: id,
+          sourceQuarter: cls.quarter,
+          newQuarter: nextQuarter,
+          newClassId: nextQuarterClass.id,
+          enrollmentsCopied: enrollments?.length || 0,
+        }),
       });
 
       return NextResponse.json({ 
@@ -205,7 +332,6 @@ export async function PUT(
 
     // Handle grading scheme update
     if (body.gradingScheme) {
-      // Check if grading period is completed - don't allow scheme changes
       if (cls.gradingPeriodStatus === "COMPLETED") {
         return NextResponse.json({ 
           error: "Cannot modify grading scheme after grading period is completed" 
@@ -214,7 +340,6 @@ export async function PUT(
       
       const { writtenWorksPercent, performanceTasksPercent, quarterlyAssessmentPercent } = body.gradingScheme;
       
-      // Validate percentages
       const ww = Number(writtenWorksPercent) || 0;
       const pt = Number(performanceTasksPercent) || 0;
       const qa = Number(quarterlyAssessmentPercent) || 0;
@@ -231,48 +356,49 @@ export async function PUT(
         }, { status: 400 });
       }
 
-      // Get old values for audit
-      const oldScheme = cls.gradingScheme;
+      // Get existing scheme
+      const { data: existingScheme } = await supabase
+        .from("grading_schemes")
+        .select("*")
+        .eq("classId", id)
+        .single();
 
-      // Update or create grading scheme
-      if (cls.gradingScheme) {
-        await db.gradingScheme.update({
-          where: { classId: id },
-          data: {
+      if (existingScheme) {
+        await supabase
+          .from("grading_schemes")
+          .update({
             writtenWorksPercent: ww,
             performanceTasksPercent: pt,
             quarterlyAssessmentPercent: qa,
-          },
-        });
+          })
+          .eq("classId", id);
       } else {
-        await db.gradingScheme.create({
-          data: {
+        await supabase
+          .from("grading_schemes")
+          .insert({
             classId: id,
             writtenWorksPercent: ww,
             performanceTasksPercent: pt,
             quarterlyAssessmentPercent: qa,
-          },
-        });
+          });
       }
 
-      // Create audit log for grading scheme change
-      await db.auditLog.create({
-        data: {
-          userId: session.user.id,
-          action: "UPDATE_GRADING_SCHEME",
-          entityType: "GradingScheme",
-          entityId: id,
-          oldValue: JSON.stringify({
-            writtenWorksPercent: oldScheme?.writtenWorksPercent || 30,
-            performanceTasksPercent: oldScheme?.performanceTasksPercent || 50,
-            quarterlyAssessmentPercent: oldScheme?.quarterlyAssessmentPercent || 20,
-          }),
-          newValue: JSON.stringify({
-            writtenWorksPercent: ww,
-            performanceTasksPercent: pt,
-            quarterlyAssessmentPercent: qa,
-          }),
-        },
+      // Create audit log
+      await supabase.from("audit_logs").insert({
+        userId: user.id,
+        action: "UPDATE_GRADING_SCHEME",
+        entityType: "GradingScheme",
+        entityId: id,
+        oldValue: JSON.stringify({
+          writtenWorksPercent: existingScheme?.writtenWorksPercent || 30,
+          performanceTasksPercent: existingScheme?.performanceTasksPercent || 50,
+          quarterlyAssessmentPercent: existingScheme?.quarterlyAssessmentPercent || 20,
+        }),
+        newValue: JSON.stringify({
+          writtenWorksPercent: ww,
+          performanceTasksPercent: pt,
+          quarterlyAssessmentPercent: qa,
+        }),
       });
 
       return NextResponse.json({ 
@@ -286,77 +412,79 @@ export async function PUT(
       const action = body.gradingPeriodAction;
       
       if (action === "complete") {
-        // Complete the grading period
-        const updated = await db.class.update({
-          where: { id },
-          data: {
+        const { error: updateError } = await supabase
+          .from("classes")
+          .update({
             gradingPeriodStatus: "COMPLETED",
-            gradingPeriodCompletedAt: new Date(),
-            gradingPeriodCompletedBy: session.user.id,
-          },
-        });
+            gradingPeriodCompletedAt: new Date().toISOString(),
+            gradingPeriodCompletedBy: user.id,
+          })
+          .eq("id", id);
 
-        // Create audit log
-        await db.auditLog.create({
-          data: {
-            userId: session.user.id,
-            action: "COMPLETE_GRADING_PERIOD",
-            entityType: "Class",
-            entityId: id,
-            oldValue: JSON.stringify({ gradingPeriodStatus: cls.gradingPeriodStatus }),
-            newValue: JSON.stringify({ gradingPeriodStatus: "COMPLETED" }),
-          },
+        if (updateError) throw updateError;
+
+        await supabase.from("audit_logs").insert({
+          userId: user.id,
+          action: "COMPLETE_GRADING_PERIOD",
+          entityType: "Class",
+          entityId: id,
+          oldValue: JSON.stringify({ gradingPeriodStatus: cls.gradingPeriodStatus }),
+          newValue: JSON.stringify({ gradingPeriodStatus: "COMPLETED" }),
         });
 
         return NextResponse.json({ 
           success: true, 
           message: "Grading period marked as completed",
-          class: updated,
         });
       } else if (action === "reopen") {
-        // Reopen the grading period
-        const updated = await db.class.update({
-          where: { id },
-          data: {
+        const { error: updateError } = await supabase
+          .from("classes")
+          .update({
             gradingPeriodStatus: "OPEN",
             gradingPeriodCompletedAt: null,
             gradingPeriodCompletedBy: null,
-          },
-        });
+          })
+          .eq("id", id);
 
-        // Create audit log
-        await db.auditLog.create({
-          data: {
-            userId: session.user.id,
-            action: "REOPEN_GRADING_PERIOD",
-            entityType: "Class",
-            entityId: id,
-            oldValue: JSON.stringify({ gradingPeriodStatus: cls.gradingPeriodStatus }),
-            newValue: JSON.stringify({ gradingPeriodStatus: "OPEN" }),
-            reason: body.reason || "Teacher reopened grading period",
-          },
+        if (updateError) throw updateError;
+
+        await supabase.from("audit_logs").insert({
+          userId: user.id,
+          action: "REOPEN_GRADING_PERIOD",
+          entityType: "Class",
+          entityId: id,
+          oldValue: JSON.stringify({ gradingPeriodStatus: cls.gradingPeriodStatus }),
+          newValue: JSON.stringify({ gradingPeriodStatus: "OPEN" }),
+          reason: body.reason || "Teacher reopened grading period",
         });
 
         return NextResponse.json({ 
           success: true, 
           message: "Grading period reopened",
-          class: updated,
         });
       }
     }
 
     // Regular class update
-    const updated = await db.class.update({
-      where: { id },
-      data: {
+    const { error: updateError } = await supabase
+      .from("classes")
+      .update({
         name: body.name,
         subject: body.subject,
         section: body.section,
         schoolYear: body.schoolYear,
         quarter: body.quarter,
         isActive: body.isActive,
-      },
-    });
+      })
+      .eq("id", id);
+
+    if (updateError) throw updateError;
+
+    const { data: updated } = await supabase
+      .from("classes")
+      .select()
+      .eq("id", id)
+      .single();
 
     return NextResponse.json(updated);
   } catch (error) {
@@ -374,19 +502,31 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id || session.user.role !== "TEACHER") {
+    const supabase = await createSupabaseServerClient();
+    const user = await getCurrentUser(supabase);
+    
+    if (!user || user.role !== "TEACHER") {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
     const { id } = await params;
 
-    const cls = await db.class.findUnique({ where: { id } });
-    if (!cls || cls.ownerId !== session.user.id) {
+    const { data: cls } = await supabase
+      .from("classes")
+      .select("id, ownerId")
+      .eq("id", id)
+      .single();
+
+    if (!cls || cls.ownerId !== user.id) {
       return NextResponse.json({ error: "Access denied" }, { status: 403 });
     }
 
-    await db.class.delete({ where: { id } });
+    const { error: deleteError } = await supabase
+      .from("classes")
+      .delete()
+      .eq("id", id);
+
+    if (deleteError) throw deleteError;
 
     return NextResponse.json({ success: true });
   } catch (error) {

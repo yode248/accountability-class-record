@@ -1,8 +1,20 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getServerSession } from "next-auth";
-import { authOptions } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { z } from "zod";
+
+// Helper to get current user
+async function getCurrentUser(supabase: Awaited<ReturnType<typeof createSupabaseServerClient>>) {
+  const { data: { user }, error } = await supabase.auth.getUser();
+  if (error || !user) return null;
+  
+  const { data: userData } = await supabase
+    .from("users")
+    .select("id, role")
+    .eq("id", user.id)
+    .single();
+  
+  return userData;
+}
 
 const updateSubmissionSchema = z.object({
   status: z.enum(["PENDING", "APPROVED", "DECLINED", "NEEDS_REVISION"]).optional(),
@@ -17,32 +29,61 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id) {
+    const supabase = await createSupabaseServerClient();
+    const user = await getCurrentUser(supabase);
+    
+    if (!user) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
     const { id } = await params;
 
-    const submission = await db.scoreSubmission.findUnique({
-      where: { id },
-      include: {
-        activity: {
-          include: { class: true },
-        },
-        student: {
-          include: { studentProfile: true },
-        },
-      },
-    });
+    const { data: submission, error } = await supabase
+      .from("score_submissions")
+      .select(`
+        id,
+        rawScore,
+        evidenceUrl,
+        evidenceType,
+        notes,
+        status,
+        teacherFeedback,
+        reviewedAt,
+        reviewedBy,
+        submittedAt,
+        updatedAt,
+        activity:activities (
+          id,
+          title,
+          category,
+          maxScore,
+          class:classes (
+            id,
+            name,
+            subject,
+            ownerId
+          )
+        ),
+        student:users!score_submissions_studentId_fkey (
+          id,
+          name,
+          studentProfile:student_profiles (
+            fullName,
+            lrn
+          )
+        )
+      `)
+      .eq("id", id)
+      .single();
 
-    if (!submission) {
+    if (error || !submission) {
       return NextResponse.json({ error: "Submission not found" }, { status: 404 });
     }
 
     // Check access
-    const isOwner = submission.activity.class.ownerId === session.user.id;
-    const isStudent = submission.studentId === session.user.id;
+    const classData = submission.activity?.class as { ownerId?: string } | null;
+    const isOwner = classData?.ownerId === user.id;
+    const isStudent = submission.studentId === user.id;
 
     if (!isOwner && !isStudent) {
       return NextResponse.json({ error: "Access denied" }, { status: 403 });
@@ -64,8 +105,10 @@ export async function PUT(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id) {
+    const supabase = await createSupabaseServerClient();
+    const user = await getCurrentUser(supabase);
+    
+    if (!user) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
@@ -73,25 +116,41 @@ export async function PUT(
     const body = await request.json();
     const validated = updateSubmissionSchema.parse(body);
 
-    const submission = await db.scoreSubmission.findUnique({
-      where: { id },
-      include: { activity: { include: { class: true } } },
-    });
+    // Get submission with activity info
+    const { data: submission, error: submissionError } = await supabase
+      .from("score_submissions")
+      .select(`
+        id,
+        rawScore,
+        status,
+        teacherFeedback,
+        activity:activities (
+          id,
+          maxScore,
+          class:classes (
+            id,
+            ownerId
+          )
+        )
+      `)
+      .eq("id", id)
+      .single();
 
-    if (!submission) {
+    if (submissionError || !submission) {
       return NextResponse.json({ error: "Submission not found" }, { status: 404 });
     }
 
     // Teacher approval/decline
-    if (session.user.role === "TEACHER") {
-      if (submission.activity.class.ownerId !== session.user.id) {
+    if (user.role === "TEACHER") {
+      const classData = submission.activity?.class as { ownerId?: string } | null;
+      if (!classData || classData.ownerId !== user.id) {
         return NextResponse.json({ error: "Access denied" }, { status: 403 });
       }
 
       const oldValue = JSON.stringify(submission);
       const updateData: Record<string, unknown> = {
-        reviewedAt: new Date(),
-        reviewedBy: session.user.id,
+        reviewedAt: new Date().toISOString(),
+        reviewedBy: user.id,
       };
 
       if (validated.status) updateData.status = validated.status;
@@ -107,33 +166,35 @@ export async function PUT(
             { status: 400 }
           );
         }
-        updateData.rawScore = Math.min(validated.rawScore, submission.activity.maxScore);
+        updateData.rawScore = Math.min(validated.rawScore, (submission.activity as { maxScore: number }).maxScore);
       }
 
-      const updated = await db.scoreSubmission.update({
-        where: { id },
-        data: updateData,
-      });
+      const { data: updated, error: updateError } = await supabase
+        .from("score_submissions")
+        .update(updateData)
+        .eq("id", id)
+        .select()
+        .single();
+
+      if (updateError) throw updateError;
 
       // Create audit log
-      await db.auditLog.create({
-        data: {
-          userId: session.user.id,
-          action: validated.rawScore !== undefined ? "OVERRIDE" : validated.status || "UPDATE",
-          entityType: "ScoreSubmission",
-          entityId: id,
-          oldValue,
-          newValue: JSON.stringify(updated),
-          reason: validated.reason || validated.teacherFeedback,
-          scoreSubmissionId: id,
-        },
+      await supabase.from("audit_logs").insert({
+        userId: user.id,
+        action: validated.rawScore !== undefined ? "OVERRIDE" : validated.status || "UPDATE",
+        entityType: "ScoreSubmission",
+        entityId: id,
+        oldValue,
+        newValue: JSON.stringify(updated),
+        reason: validated.reason || validated.teacherFeedback,
+        scoreSubmissionId: id,
       });
 
       return NextResponse.json(updated);
     }
 
     // Student update (only for NEEDS_REVISION)
-    if (submission.studentId !== session.user.id) {
+    if (submission.studentId !== user.id) {
       return NextResponse.json({ error: "Access denied" }, { status: 403 });
     }
 
@@ -144,27 +205,29 @@ export async function PUT(
       );
     }
 
-    const updated = await db.scoreSubmission.update({
-      where: { id },
-      data: {
+    const { data: updated, error: updateError } = await supabase
+      .from("score_submissions")
+      .update({
         rawScore: validated.rawScore ?? submission.rawScore,
         status: "PENDING",
         teacherFeedback: null,
-        submittedAt: new Date(),
-      },
-    });
+        submittedAt: new Date().toISOString(),
+      })
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (updateError) throw updateError;
 
     // Create audit log
-    await db.auditLog.create({
-      data: {
-        userId: session.user.id,
-        action: "UPDATE",
-        entityType: "ScoreSubmission",
-        entityId: id,
-        oldValue: JSON.stringify(submission),
-        newValue: JSON.stringify(updated),
-        scoreSubmissionId: id,
-      },
+    await supabase.from("audit_logs").insert({
+      userId: user.id,
+      action: "UPDATE",
+      entityType: "ScoreSubmission",
+      entityId: id,
+      oldValue: JSON.stringify(submission),
+      newValue: JSON.stringify(updated),
+      scoreSubmissionId: id,
     });
 
     return NextResponse.json(updated);

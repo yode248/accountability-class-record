@@ -1,45 +1,88 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getServerSession } from "next-auth";
-import { authOptions } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { createSupabaseServerClient } from "@/lib/supabase/server";
 
 // GET /api/me - Get current user info
 export async function GET() {
   try {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id) {
+    const supabase = await createSupabaseServerClient();
+    
+    const { data: { user: authUser }, error: authError } = await supabase.auth.getUser();
+
+    if (authError || !authUser) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const user = await db.user.findUnique({
-      where: { id: session.user.id },
-      include: {
-        studentProfile: true,
-        ownedClasses: session.user.role === "TEACHER" ? {
-          select: { id: true, name: true, code: true },
-          take: 5,
-          orderBy: { createdAt: "desc" },
-        } : false,
-        enrollments: session.user.role === "STUDENT" ? {
-          include: { class: { select: { id: true, name: true, subject: true } } },
-          take: 5,
-          orderBy: { enrolledAt: "desc" },
-        } : false,
-      },
-    });
+    // Get user profile with related data
+    const { data: userData, error: profileError } = await supabase
+      .from("users")
+      .select(`
+        id,
+        email,
+        name,
+        role,
+        avatar,
+        studentProfile:student_profiles (
+          fullName,
+          lrn,
+          sex,
+          section
+        )
+      `)
+      .eq("id", authUser.id)
+      .single();
 
-    if (!user) {
-      return NextResponse.json({ error: "User not found" }, { status: 404 });
+    if (profileError) {
+      console.error("Error fetching user profile:", profileError);
+      // Return basic user data from auth
+      return NextResponse.json({
+        id: authUser.id,
+        email: authUser.email,
+        name: authUser.user_metadata?.name,
+        role: authUser.user_metadata?.role || "STUDENT",
+        avatar: null,
+        studentProfile: null,
+        classes: [],
+      });
+    }
+
+    // Get classes based on role
+    let classes: unknown[] = [];
+    
+    if (userData.role === "TEACHER") {
+      const { data: ownedClasses } = await supabase
+        .from("classes")
+        .select("id, name, code")
+        .eq("ownerId", authUser.id)
+        .order("createdAt", { ascending: false })
+        .limit(5);
+      
+      classes = ownedClasses || [];
+    } else {
+      const { data: enrollments } = await supabase
+        .from("enrollments")
+        .select(`
+          class:classes (
+            id,
+            name,
+            subject
+          )
+        `)
+        .eq("studentId", authUser.id)
+        .eq("isActive", true)
+        .order("enrolledAt", { ascending: false })
+        .limit(5);
+      
+      classes = enrollments?.map((e) => e.class).filter(Boolean) || [];
     }
 
     return NextResponse.json({
-      id: user.id,
-      email: user.email,
-      name: user.name,
-      role: user.role,
-      avatar: user.avatar,
-      studentProfile: user.studentProfile,
-      classes: user.ownedClasses || user.enrollments?.map((e) => e.class) || [],
+      id: userData.id,
+      email: userData.email,
+      name: userData.name,
+      role: userData.role,
+      avatar: userData.avatar,
+      studentProfile: userData.studentProfile?.[0] || null,
+      classes,
     });
   } catch (error) {
     console.error("Get user error:", error);
@@ -53,8 +96,11 @@ export async function GET() {
 // PUT /api/me - Update user profile
 export async function PUT(request: NextRequest) {
   try {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id) {
+    const supabase = await createSupabaseServerClient();
+    
+    const { data: { user: authUser }, error: authError } = await supabase.auth.getUser();
+
+    if (authError || !authUser) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
@@ -62,28 +108,51 @@ export async function PUT(request: NextRequest) {
 
     // Update user name
     if (body.name) {
-      await db.user.update({
-        where: { id: session.user.id },
-        data: { name: body.name },
-      });
+      const { error: updateError } = await supabase
+        .from("users")
+        .update({ name: body.name })
+        .eq("id", authUser.id);
+
+      if (updateError) {
+        console.error("Error updating user:", updateError);
+      }
     }
 
+    // Get current user role
+    const { data: userData } = await supabase
+      .from("users")
+      .select("role")
+      .eq("id", authUser.id)
+      .single();
+
     // Update student profile if provided
-    if (session.user.role === "STUDENT" && (body.fullName || body.lrn)) {
-      await db.studentProfile.upsert({
-        where: { userId: session.user.id },
-        create: {
-          userId: session.user.id,
-          fullName: body.fullName,
-          lrn: body.lrn,
-          sex: body.sex,
-        },
-        update: {
-          fullName: body.fullName,
-          lrn: body.lrn,
-          sex: body.sex,
-        },
-      });
+    if (userData?.role === "STUDENT" && (body.fullName || body.lrn)) {
+      // Check if profile exists
+      const { data: existingProfile } = await supabase
+        .from("student_profiles")
+        .select("userId")
+        .eq("userId", authUser.id)
+        .single();
+
+      if (existingProfile) {
+        await supabase
+          .from("student_profiles")
+          .update({
+            fullName: body.fullName,
+            lrn: body.lrn,
+            sex: body.sex,
+          })
+          .eq("userId", authUser.id);
+      } else {
+        await supabase
+          .from("student_profiles")
+          .insert({
+            userId: authUser.id,
+            fullName: body.fullName,
+            lrn: body.lrn,
+            sex: body.sex,
+          });
+      }
     }
 
     return NextResponse.json({ success: true });

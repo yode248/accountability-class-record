@@ -1,26 +1,40 @@
-import { NextRequest, NextResponse } from "next/server";
-import { getServerSession } from "next-auth";
-import { authOptions } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { NextResponse } from "next/server";
+import { createSupabaseServerClient } from "@/lib/supabase/server";
 
-// POST /api/notifications/read-all - Mark all notifications as read
-export async function POST(request: NextRequest) {
+// Helper to get current user
+async function getCurrentUser(supabase: Awaited<ReturnType<typeof createSupabaseServerClient>>) {
+  const { data: { user }, error } = await supabase.auth.getUser();
+  if (error || !user) return null;
+  
+  const { data: userData } = await supabase
+    .from("users")
+    .select("id, role")
+    .eq("id", user.id)
+    .single();
+  
+  return userData;
+}
+
+// PUT /api/notifications/read-all - Mark all notifications as read
+export async function PUT() {
   try {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id) {
+    const supabase = await createSupabaseServerClient();
+    const user = await getCurrentUser(supabase);
+    
+    if (!user) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    // Mark all as read for this user
-    const result = await db.notification.updateMany({
-      where: {
-        toUserId: session.user.id,
-        isRead: false,
-      },
-      data: { isRead: true },
-    });
+    // Mark all as read
+    const { error: updateError } = await supabase
+      .from("notifications")
+      .update({ isRead: true })
+      .eq("toUserId", user.id)
+      .eq("isRead", false);
 
-    return NextResponse.json({ count: result.count });
+    if (updateError) throw updateError;
+
+    return NextResponse.json({ success: true });
   } catch (error) {
     console.error("Mark all notifications read error:", error);
     return NextResponse.json(

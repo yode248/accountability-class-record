@@ -1,8 +1,20 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getServerSession } from "next-auth";
-import { authOptions } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { z } from "zod";
+
+// Helper to get current user
+async function getCurrentUser(supabase: Awaited<ReturnType<typeof createSupabaseServerClient>>) {
+  const { data: { user }, error } = await supabase.auth.getUser();
+  if (error || !user) return null;
+  
+  const { data: userData } = await supabase
+    .from("users")
+    .select("id, role")
+    .eq("id", user.id)
+    .single();
+  
+  return userData;
+}
 
 const createActivitySchema = z.object({
   classId: z.string(),
@@ -19,8 +31,10 @@ const createActivitySchema = z.object({
 // GET /api/activities - Get activities for a class
 export async function GET(request: NextRequest) {
   try {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id) {
+    const supabase = await createSupabaseServerClient();
+    const user = await getCurrentUser(supabase);
+    
+    if (!user) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
@@ -32,35 +46,76 @@ export async function GET(request: NextRequest) {
     }
 
     // Verify access
-    const cls = await db.class.findUnique({
-      where: { id: classId },
-      include: {
-        enrollments: { where: { studentId: session.user.id } },
-      },
-    });
+    const { data: cls, error: classError } = await supabase
+      .from("classes")
+      .select("id, ownerId")
+      .eq("id", classId)
+      .single();
 
-    if (!cls) {
+    if (classError || !cls) {
       return NextResponse.json({ error: "Class not found" }, { status: 404 });
     }
 
-    const isOwner = cls.ownerId === session.user.id;
-    const isEnrolled = cls.enrollments.length > 0;
+    const isOwner = cls.ownerId === user.id;
+    
+    // Check enrollment for students
+    let isEnrolled = false;
+    if (user.role === "STUDENT") {
+      const { data: enrollment } = await supabase
+        .from("enrollments")
+        .select("id")
+        .eq("classId", classId)
+        .eq("studentId", user.id)
+        .single();
+      isEnrolled = !!enrollment;
+    }
 
     if (!isOwner && !isEnrolled) {
       return NextResponse.json({ error: "Access denied" }, { status: 403 });
     }
 
-    const activities = await db.activity.findMany({
-      where: { classId },
-      orderBy: [{ category: "asc" }, { order: "asc" }],
-      include: {
-        _count: {
-          select: { submissions: true },
-        },
-      },
+    // Get activities
+    let query = supabase
+      .from("activities")
+      .select(`
+        id,
+        category,
+        title,
+        description,
+        maxScore,
+        dueDate,
+        instructions,
+        requiresEvidence,
+        evidenceTypes,
+        order,
+        isActive,
+        archived,
+        archivedAt,
+        archiveReason,
+        createdAt,
+        class:classes (name),
+        submissions (count)
+      `)
+      .eq("classId", classId);
+
+    // Students can't see archived activities
+    if (user.role === "STUDENT") {
+      query = query.eq("archived", false);
+    }
+
+    const { data: activities, error } = await query;
+
+    if (error) throw error;
+
+    // Sort by category then order
+    const sorted = (activities || []).sort((a, b) => {
+      if (a.category !== b.category) {
+        return a.category.localeCompare(b.category);
+      }
+      return (a.order || 0) - (b.order || 0);
     });
 
-    return NextResponse.json(activities);
+    return NextResponse.json(sorted);
   } catch (error) {
     console.error("Get activities error:", error);
     return NextResponse.json(
@@ -73,8 +128,10 @@ export async function GET(request: NextRequest) {
 // POST /api/activities - Create activity (Teacher only)
 export async function POST(request: NextRequest) {
   try {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id || session.user.role !== "TEACHER") {
+    const supabase = await createSupabaseServerClient();
+    const user = await getCurrentUser(supabase);
+    
+    if (!user || user.role !== "TEACHER") {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
@@ -82,11 +139,13 @@ export async function POST(request: NextRequest) {
     const validated = createActivitySchema.parse(body);
 
     // Verify ownership
-    const cls = await db.class.findUnique({
-      where: { id: validated.classId },
-    });
+    const { data: cls, error: classError } = await supabase
+      .from("classes")
+      .select("id, ownerId, gradingPeriodStatus")
+      .eq("id", validated.classId)
+      .single();
 
-    if (!cls || cls.ownerId !== session.user.id) {
+    if (classError || !cls || cls.ownerId !== user.id) {
       return NextResponse.json({ error: "Access denied" }, { status: 403 });
     }
 
@@ -98,25 +157,36 @@ export async function POST(request: NextRequest) {
     }
 
     // Get max order for this category
-    const maxOrderActivity = await db.activity.findFirst({
-      where: { classId: validated.classId, category: validated.category },
-      orderBy: { order: "desc" },
-    });
+    const { data: maxOrderActivity } = await supabase
+      .from("activities")
+      .select("order")
+      .eq("classId", validated.classId)
+      .eq("category", validated.category)
+      .order("order", { ascending: false })
+      .limit(1)
+      .single();
 
-    const activity = await db.activity.create({
-      data: {
+    const order = (maxOrderActivity?.order || 0) + 1;
+
+    // Create activity
+    const { data: activity, error } = await supabase
+      .from("activities")
+      .insert({
         classId: validated.classId,
         category: validated.category,
         title: validated.title,
         description: validated.description,
         maxScore: validated.maxScore,
-        dueDate: validated.dueDate ? new Date(validated.dueDate) : null,
+        dueDate: validated.dueDate ? new Date(validated.dueDate).toISOString() : null,
         instructions: validated.instructions,
         requiresEvidence: validated.requiresEvidence ?? false,
         evidenceTypes: validated.evidenceTypes ? JSON.stringify(validated.evidenceTypes) : null,
-        order: (maxOrderActivity?.order ?? 0) + 1,
-      },
-    });
+        order,
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
 
     return NextResponse.json(activity);
   } catch (error) {
