@@ -1,13 +1,26 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getServerSession } from "next-auth";
-import { authOptions } from "@/lib/auth";
+import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { db } from "@/lib/db";
+
+// Helper to get current user
+async function getCurrentUser(supabase: Awaited<ReturnType<typeof createSupabaseServerClient>>) {
+  const { data: { user }, error } = await supabase.auth.getUser();
+  if (error || !user) return null;
+  
+  const { data: userData } = await db.user.findUnique({
+    where: { id: user.id }
+  });
+  
+  return userData;
+}
 
 // GET /api/audit - Get audit logs
 export async function GET(request: NextRequest) {
   try {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id) {
+    const supabase = await createSupabaseServerClient();
+    const user = await getCurrentUser(supabase);
+    
+    if (!user) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
@@ -26,16 +39,14 @@ export async function GET(request: NextRequest) {
 
     // If filtering by student, we need to find logs related to their submissions
     if (studentId) {
-      const scoreSubmissions = await db.scoreSubmission.findMany({
+      const submissions = await db.scoreSubmission.findMany({
         where: { studentId },
-        select: { id: true },
       });
       const attendanceSubmissions = await db.attendanceSubmission.findMany({
         where: { studentId },
-        select: { id: true },
       });
 
-      const scoreIds = scoreSubmissions.map((s) => s.id);
+      const scoreIds = submissions.map((s) => s.id);
       const attendanceIds = attendanceSubmissions.map((a) => a.id);
 
       where.OR = [
@@ -44,23 +55,9 @@ export async function GET(request: NextRequest) {
       ];
     }
 
-    // If filtering by class (teacher only)
-    if (classId && session.user.role === "TEACHER") {
-      const cls = await db.class.findUnique({
-        where: { id: classId },
-      });
-      if (!cls || cls.ownerId !== session.user.id) {
-        return NextResponse.json({ error: "Access denied" }, { status: 403 });
-      }
-    }
-
     const logs = await db.auditLog.findMany({
       where,
-      include: {
-        user: { select: { name: true, email: true } },
-      },
       orderBy: { createdAt: "desc" },
-      take: limit,
     });
 
     return NextResponse.json(logs);

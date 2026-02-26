@@ -1,7 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getServerSession } from "next-auth";
-import { authOptions } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { z } from "zod";
 
 const submitAttendanceSchema = z.object({
@@ -11,48 +9,87 @@ const submitAttendanceSchema = z.object({
   qrToken: z.string().nullish(),
 });
 
+// Helper to get current user
+async function getCurrentUser(supabase: Awaited<ReturnType<typeof createSupabaseServerClient>>) {
+  const { data: { user }, error } = await supabase.auth.getUser();
+  if (error || !user) return null;
+  
+  const { data: userData } = await supabase
+    .from("User")
+    .select("id, role, name")
+    .eq("id", user.id)
+    .single();
+  
+  return userData;
+}
+
 // GET /api/attendance/[sessionId] - Get attendance session details
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ sessionId: string }> }
 ) {
   try {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id) {
+    const supabase = await createSupabaseServerClient();
+    const user = await getCurrentUser(supabase);
+    
+    if (!user) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
     const { sessionId } = await params;
 
-    const attendanceSession = await db.attendanceSession.findUnique({
-      where: { id: sessionId },
-      include: {
-        class: {
-          include: {
-            enrollments: session.user.role === "TEACHER"
-              ? { include: { profile: true, student: true } }
-              : { where: { studentId: session.user.id } },
-          },
-        },
-        submissions: session.user.role === "TEACHER"
-          ? { include: { student: { include: { studentProfile: true } } } }
-          : { where: { studentId: session.user.id } },
-      },
-    });
+    const { data: attendanceSession, error } = await supabase
+      .from("AttendanceSession")
+      .select(`
+        *,
+        Class (
+          id,
+          name,
+          ownerId,
+          Enrollment (
+            id,
+            studentId,
+            profile:StudentProfile (*)
+          )
+        )
+      `)
+      .eq("id", sessionId)
+      .single();
 
-    if (!attendanceSession) {
+    if (error || !attendanceSession) {
       return NextResponse.json({ error: "Session not found" }, { status: 404 });
     }
 
     // Check access
-    const isOwner = attendanceSession.class.ownerId === session.user.id;
-    const isEnrolled = attendanceSession.class.enrollments.length > 0;
+    const isOwner = attendanceSession.Class?.ownerId === user.id;
+    const isEnrolled = attendanceSession.Class?.Enrollment?.some(
+      (e: { studentId: string }) => e.studentId === user.id
+    );
 
     if (!isOwner && !isEnrolled) {
       return NextResponse.json({ error: "Access denied" }, { status: 403 });
     }
 
-    return NextResponse.json(attendanceSession);
+    // Get submissions based on role
+    let submissionsQuery = supabase
+      .from("AttendanceSubmission")
+      .select(`
+        *,
+        student:User (id, name),
+        profile:StudentProfile (*)
+      `)
+      .eq("sessionId", sessionId);
+
+    if (user.role === "STUDENT") {
+      submissionsQuery = submissionsQuery.eq("studentId", user.id);
+    }
+
+    const { data: submissions } = await submissionsQuery;
+
+    return NextResponse.json({
+      ...attendanceSession,
+      submissions: submissions || [],
+    });
   } catch (error) {
     console.error("Get attendance session error:", error);
     return NextResponse.json(
@@ -68,8 +105,10 @@ export async function POST(
   { params }: { params: Promise<{ sessionId: string }> }
 ) {
   try {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id || session.user.role !== "STUDENT") {
+    const supabase = await createSupabaseServerClient();
+    const user = await getCurrentUser(supabase);
+    
+    if (!user || user.role !== "STUDENT") {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
@@ -77,18 +116,28 @@ export async function POST(
     const body = await request.json();
     const validated = submitAttendanceSchema.parse(body);
 
-    const attendanceSession = await db.attendanceSession.findUnique({
-      where: { id: sessionId },
-      include: {
-        class: {
-          include: {
-            enrollments: { where: { studentId: session.user.id } },
-          },
-        },
-      },
-    });
+    // Get session and verify enrollment
+    const { data: attendanceSession, error: sessionError } = await supabase
+      .from("AttendanceSession")
+      .select(`
+        *,
+        Class (
+          id,
+          Enrollment!Enrollment_classId_fkey (studentId)
+        )
+      `)
+      .eq("id", sessionId)
+      .single();
 
-    if (!attendanceSession || attendanceSession.class.enrollments.length === 0) {
+    if (sessionError || !attendanceSession) {
+      return NextResponse.json({ error: "Session not found" }, { status: 404 });
+    }
+
+    const isEnrolled = attendanceSession.Class?.Enrollment?.some(
+      (e: { studentId: string }) => e.studentId === user.id
+    );
+
+    if (!isEnrolled) {
       return NextResponse.json({ error: "Access denied" }, { status: 403 });
     }
 
@@ -100,7 +149,7 @@ export async function POST(
           { status: 400 }
         );
       }
-      if (attendanceSession.qrExpiresAt && new Date() > attendanceSession.qrExpiresAt) {
+      if (attendanceSession.qrExpiresAt && new Date() > new Date(attendanceSession.qrExpiresAt)) {
         return NextResponse.json(
           { error: "QR code has expired" },
           { status: 400 }
@@ -109,14 +158,12 @@ export async function POST(
     }
 
     // Check for existing submission
-    const existing = await db.attendanceSubmission.findUnique({
-      where: {
-        sessionId_studentId: {
-          sessionId,
-          studentId: session.user.id,
-        },
-      },
-    });
+    const { data: existing } = await supabase
+      .from("AttendanceSubmission")
+      .select("*")
+      .eq("sessionId", sessionId)
+      .eq("studentId", user.id)
+      .single();
 
     if (existing && existing.submissionStatus !== "NEEDS_REVISION" && existing.submissionStatus !== "DECLINED") {
       return NextResponse.json(
@@ -136,41 +183,41 @@ export async function POST(
       }
     }
 
-    const submission = await db.attendanceSubmission.upsert({
-      where: {
-        sessionId_studentId: {
-          sessionId,
-          studentId: session.user.id,
-        },
-      },
-      create: {
+    // Upsert submission
+    const { data: submission, error: submitError } = await supabase
+      .from("AttendanceSubmission")
+      .upsert({
         sessionId,
-        studentId: session.user.id,
+        studentId: user.id,
         status: finalStatus,
         proofUrl: validated.proofUrl,
         notes: validated.notes,
-        checkedInAt: new Date(),
-      },
-      update: {
-        status: finalStatus,
-        proofUrl: validated.proofUrl,
-        notes: validated.notes,
-        checkedInAt: new Date(),
+        checkedInAt: new Date().toISOString(),
         submissionStatus: "PENDING",
-        teacherFeedback: null,
-      },
-    });
+        submittedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      }, {
+        onConflict: "sessionId_studentId"
+      })
+      .select()
+      .single();
+
+    if (submitError) {
+      console.error("Submit error:", submitError);
+      return NextResponse.json(
+        { error: "Failed to submit attendance" },
+        { status: 500 }
+      );
+    }
 
     // Create audit log
-    await db.auditLog.create({
-      data: {
-        userId: session.user.id,
-        action: existing ? "UPDATE" : "CREATE",
-        entityType: "AttendanceSubmission",
-        entityId: submission.id,
-        newValue: JSON.stringify(submission),
-        attendanceSubmissionId: submission.id,
-      },
+    await supabase.from("AuditLog").insert({
+      userId: user.id,
+      action: existing ? "UPDATE" : "CREATE",
+      entityType: "AttendanceSubmission",
+      entityId: submission.id,
+      newValue: JSON.stringify(submission),
+      createdAt: new Date().toISOString(),
     });
 
     return NextResponse.json(submission);
@@ -189,31 +236,52 @@ export async function PUT(
   { params }: { params: Promise<{ sessionId: string }> }
 ) {
   try {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id || session.user.role !== "TEACHER") {
+    const supabase = await createSupabaseServerClient();
+    const user = await getCurrentUser(supabase);
+    
+    if (!user || user.role !== "TEACHER") {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
     const { sessionId } = await params;
     const body = await request.json();
 
-    const attendanceSession = await db.attendanceSession.findUnique({
-      where: { id: sessionId },
-      include: { class: true },
-    });
+    // Get session and verify ownership
+    const { data: attendanceSession, error: sessionError } = await supabase
+      .from("AttendanceSession")
+      .select(`
+        *,
+        Class (ownerId)
+      `)
+      .eq("id", sessionId)
+      .single();
 
-    if (!attendanceSession || attendanceSession.class.ownerId !== session.user.id) {
+    if (sessionError || !attendanceSession) {
+      return NextResponse.json({ error: "Session not found" }, { status: 404 });
+    }
+
+    if (attendanceSession.Class?.ownerId !== user.id) {
       return NextResponse.json({ error: "Access denied" }, { status: 403 });
     }
 
-    const updated = await db.attendanceSession.update({
-      where: { id: sessionId },
-      data: {
+    const { data: updated, error: updateError } = await supabase
+      .from("AttendanceSession")
+      .update({
         title: body.title,
         lateThresholdMinutes: body.lateThresholdMinutes,
         isActive: body.isActive,
-      },
-    });
+        updatedAt: new Date().toISOString(),
+      })
+      .eq("id", sessionId)
+      .select()
+      .single();
+
+    if (updateError) {
+      return NextResponse.json(
+        { error: "Failed to update session" },
+        { status: 500 }
+      );
+    }
 
     return NextResponse.json(updated);
   } catch (error) {
@@ -231,23 +299,44 @@ export async function DELETE(
   { params }: { params: Promise<{ sessionId: string }> }
 ) {
   try {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id || session.user.role !== "TEACHER") {
+    const supabase = await createSupabaseServerClient();
+    const user = await getCurrentUser(supabase);
+    
+    if (!user || user.role !== "TEACHER") {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
     const { sessionId } = await params;
 
-    const attendanceSession = await db.attendanceSession.findUnique({
-      where: { id: sessionId },
-      include: { class: true },
-    });
+    // Get session and verify ownership
+    const { data: attendanceSession, error: sessionError } = await supabase
+      .from("AttendanceSession")
+      .select(`
+        *,
+        Class (ownerId)
+      `)
+      .eq("id", sessionId)
+      .single();
 
-    if (!attendanceSession || attendanceSession.class.ownerId !== session.user.id) {
+    if (sessionError || !attendanceSession) {
+      return NextResponse.json({ error: "Session not found" }, { status: 404 });
+    }
+
+    if (attendanceSession.Class?.ownerId !== user.id) {
       return NextResponse.json({ error: "Access denied" }, { status: 403 });
     }
 
-    await db.attendanceSession.delete({ where: { id: sessionId } });
+    const { error: deleteError } = await supabase
+      .from("AttendanceSession")
+      .delete()
+      .eq("id", sessionId);
+
+    if (deleteError) {
+      return NextResponse.json(
+        { error: "Failed to delete session" },
+        { status: 500 }
+      );
+    }
 
     return NextResponse.json({ success: true });
   } catch (error) {

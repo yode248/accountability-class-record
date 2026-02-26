@@ -1,7 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
-import { z } from "zod";
-import { nanoid } from "nanoid";
 
 // Helper to get current user
 async function getCurrentUser(supabase: Awaited<ReturnType<typeof createSupabaseServerClient>>) {
@@ -9,21 +7,13 @@ async function getCurrentUser(supabase: Awaited<ReturnType<typeof createSupabase
   if (error || !user) return null;
   
   const { data: userData } = await supabase
-    .from("users")
-    .select("id, role")
+    .from("User")
+    .select("id, role, name")
     .eq("id", user.id)
     .single();
   
   return userData;
 }
-
-const createSessionSchema = z.object({
-  classId: z.string(),
-  date: z.string(),
-  title: z.string().nullish(),
-  lateThresholdMinutes: z.number().optional(),
-  enableQr: z.boolean().optional(),
-});
 
 // GET /api/attendance - Get attendance sessions
 export async function GET(request: NextRequest) {
@@ -39,85 +29,57 @@ export async function GET(request: NextRequest) {
     const classId = searchParams.get("classId");
 
     if (!classId) {
-      return NextResponse.json({ error: "Class ID required" }, { status: 400 });
+      return NextResponse.json([]);
     }
 
-    // Verify access
-    const { data: cls, error: classError } = await supabase
-      .from("classes")
-      .select("id, ownerId")
-      .eq("id", classId)
-      .single();
-
-    if (classError || !cls) {
-      return NextResponse.json({ error: "Class not found" }, { status: 404 });
-    }
-
-    const isOwner = cls.ownerId === user.id;
-    
-    // Check enrollment for students
-    let isEnrolled = false;
-    if (user.role === "STUDENT") {
+    // Check access
+    if (user.role === "TEACHER") {
+      const { data: cls } = await supabase
+        .from("Class")
+        .select("id")
+        .eq("id", classId)
+        .eq("ownerId", user.id)
+        .single();
+      
+      if (!cls) {
+        return NextResponse.json({ error: "Access denied" }, { status: 403 });
+      }
+    } else {
       const { data: enrollment } = await supabase
-        .from("enrollments")
+        .from("Enrollment")
         .select("id")
         .eq("classId", classId)
         .eq("studentId", user.id)
         .single();
-      isEnrolled = !!enrollment;
+      
+      if (!enrollment) {
+        return NextResponse.json({ error: "Access denied" }, { status: 403 });
+      }
     }
 
-    const hasAccess = isOwner || isEnrolled;
-
-    if (!hasAccess) {
-      return NextResponse.json({ error: "Access denied" }, { status: 403 });
-    }
-
-    // Get attendance sessions with submissions
+    // Get sessions
     const { data: sessions, error } = await supabase
-      .from("attendance_sessions")
+      .from("AttendanceSession")
       .select(`
-        id,
-        date,
-        title,
-        lateThresholdMinutes,
-        qrToken,
-        qrExpiresAt,
-        isActive,
-        createdAt,
-        submissions:attendance_submissions (
+        *,
+        submissions:AttendanceSubmission (
           id,
-          status,
-          proofUrl,
-          checkedInAt,
-          notes,
-          submissionStatus,
-          teacherFeedback,
           studentId,
-          student:users!attendance_submissions_studentId_fkey (
-            id,
-            name,
-            studentProfile:student_profiles (
-              fullName,
-              lrn
-            )
-          )
+          status,
+          submissionStatus,
+          submittedAt
         )
       `)
       .eq("classId", classId)
+      .eq("isActive", true)
       .order("date", { ascending: false });
 
-    if (error) throw error;
+    if (error) {
+      console.error("Error fetching sessions:", error);
+      return NextResponse.json([]);
+    }
 
-    // For students, filter to only their submissions
-    const result = (sessions || []).map(session => ({
-      ...session,
-      submissions: user.role === "STUDENT" 
-        ? (session.submissions || []).filter((s: { studentId: string }) => s.studentId === user.id)
-        : session.submissions,
-    }));
-
-    return NextResponse.json(result);
+    return NextResponse.json(sessions || []);
   } catch (error) {
     console.error("Get attendance error:", error);
     return NextResponse.json(
@@ -138,42 +100,46 @@ export async function POST(request: NextRequest) {
     }
 
     const body = await request.json();
-    const validated = createSessionSchema.parse(body);
+    const { classId, title, date, lateThresholdMinutes } = body;
+
+    if (!classId) {
+      return NextResponse.json({ error: "Class ID required" }, { status: 400 });
+    }
 
     // Verify ownership
-    const { data: cls, error: classError } = await supabase
-      .from("classes")
+    const { data: cls } = await supabase
+      .from("Class")
       .select("id, ownerId")
-      .eq("id", validated.classId)
+      .eq("id", classId)
       .single();
 
-    if (classError || !cls || cls.ownerId !== user.id) {
+    if (!cls || cls.ownerId !== user.id) {
       return NextResponse.json({ error: "Access denied" }, { status: 403 });
     }
 
-    const qrToken = validated.enableQr ? nanoid(10).toUpperCase() : null;
-    const qrExpiresAt = validated.enableQr
-      ? new Date(Date.now() + 15 * 60 * 1000).toISOString() // 15 minutes
-      : null;
-
+    // Create session
     const { data: session, error } = await supabase
-      .from("attendance_sessions")
+      .from("AttendanceSession")
       .insert({
-        classId: validated.classId,
-        date: new Date(validated.date).toISOString(),
-        title: validated.title,
-        lateThresholdMinutes: validated.lateThresholdMinutes ?? 15,
-        qrToken,
-        qrExpiresAt,
+        classId,
+        title: title || `Attendance - ${new Date(date || Date.now()).toLocaleDateString()}`,
+        date: date || new Date().toISOString(),
+        lateThresholdMinutes: lateThresholdMinutes || 15,
+        isActive: true,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
       })
       .select()
       .single();
 
-    if (error) throw error;
+    if (error) {
+      console.error("Error creating session:", error);
+      return NextResponse.json({ error: "Failed to create session" }, { status: 500 });
+    }
 
     return NextResponse.json(session);
   } catch (error) {
-    console.error("Create attendance session error:", error);
+    console.error("Create attendance error:", error);
     return NextResponse.json(
       { error: "Failed to create attendance session" },
       { status: 500 }

@@ -1,82 +1,84 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getServerSession } from "next-auth";
-import { authOptions } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { createSupabaseServerClient } from "@/lib/supabase/server";
 
-// GET /api/teacher/activities/:id/missing
-// Returns list of students with their submission status for a specific activity
+// Helper to get current user
+async function getCurrentUser(supabase: Awaited<ReturnType<typeof createSupabaseServerClient>>) {
+  const { data: { user }, error } = await supabase.auth.getUser();
+  if (error || !user) return null;
+  
+  const { data: userData } = await supabase
+    .from("User")
+    .select("id, role")
+    .eq("id", user.id)
+    .single();
+  
+  return userData;
+}
+
+// GET /api/teacher/activities/[id]/missing
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const session = await getServerSession(authOptions);
-    if (!session?.user?.id || session.user.role !== "TEACHER") {
+    const supabase = await createSupabaseServerClient();
+    const user = await getCurrentUser(supabase);
+    
+    if (!user || user.role !== "TEACHER") {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
     const { id: activityId } = await params;
 
     // Get the activity and verify ownership
-    const activity = await db.activity.findUnique({
-      where: { id: activityId },
-      include: {
-        class: {
-          select: {
-            id: true,
-            name: true,
-            ownerId: true,
-          },
-        },
-      },
-    });
+    const { data: activity, error: activityError } = await supabase
+      .from("Activity")
+      .select(`
+        id,
+        title,
+        maxScore,
+        dueDate,
+        category,
+        classId,
+        Class (id, name, ownerId)
+      `)
+      .eq("id", activityId)
+      .single();
 
-    if (!activity) {
+    if (activityError || !activity) {
       return NextResponse.json({ error: "Activity not found" }, { status: 404 });
     }
 
     // Verify teacher owns this class
-    if (activity.class.ownerId !== session.user.id) {
+    if (activity.Class?.ownerId !== user.id) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 403 });
     }
 
     // Get all enrolled students with their profiles
-    const enrollments = await db.enrollment.findMany({
-      where: { classId: activity.classId, isActive: true },
-      include: {
-        profile: {
-          select: {
-            fullName: true,
-            lrn: true,
-          },
-        },
-        student: {
-          select: {
-            id: true,
-            name: true,
-          },
-        },
-      },
-    });
+    const { data: enrollments } = await supabase
+      .from("Enrollment")
+      .select(`
+        studentId,
+        profileId,
+        profile:StudentProfile (fullName, lrn),
+        student:User (id, name)
+      `)
+      .eq("classId", activity.classId)
+      .eq("isActive", true);
 
     // Get all submissions for this activity
-    const submissions = await db.scoreSubmission.findMany({
-      where: { activityId },
-      select: {
-        studentId: true,
-        status: true,
-        rawScore: true,
-        submittedAt: true,
-      },
-    });
+    const { data: submissions } = await supabase
+      .from("ScoreSubmission")
+      .select("studentId, status, rawScore, submittedAt")
+      .eq("activityId", activityId);
 
     // Create a map of student submissions
     const submissionMap = new Map(
-      submissions.map((sub) => [sub.studentId, sub])
+      submissions?.map((sub) => [sub.studentId, sub]) || []
     );
 
     // Build roster with status
-    const roster = enrollments.map((enrollment) => {
+    const roster = enrollments?.map((enrollment) => {
       const submission = submissionMap.get(enrollment.studentId);
       
       let status: string;
@@ -88,13 +90,13 @@ export async function GET(
 
       return {
         studentId: enrollment.studentId,
-        studentName: enrollment.profile.fullName || enrollment.student.name || "Unknown",
-        lrn: enrollment.profile.lrn,
+        studentName: enrollment.profile?.fullName || enrollment.student?.name || "Unknown",
+        lrn: enrollment.profile?.lrn,
         status,
         rawScore: submission?.rawScore ?? null,
         submittedAt: submission?.submittedAt ?? null,
       };
-    });
+    }) || [];
 
     // Calculate counts
     const counts = {
@@ -114,7 +116,7 @@ export async function GET(
         dueDate: activity.dueDate,
         category: activity.category,
       },
-      class: activity.class,
+      class: activity.Class,
       counts,
       roster,
     });
